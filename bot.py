@@ -1,40 +1,62 @@
+
 # bot.py
 # Telegram bot: water + calories goals, food/workout/water logging, progress report
 # aiogram v3.x, in-memory storage (no DB)
+#
+# Food calories source:
+#   - Primary: ChatGPT API (kcal per 100g as a number)
+#   - Fallback: OpenFoodFacts (kcal/kJ per 100g)
+#
+# Workout calories source:
+#   - Primary: ChatGPT API (kcal burned for free-form activity + minutes + user weight)
+#   - If OpenAI is unavailable -> we do NOT guess; we ask to set OPENAI_API_KEY.
+#
+# ENV vars:
+#   BOT_TOKEN=...
+#   OWM_API_KEY=...          (optional)
+#   OPENAI_API_KEY=...       (recommended)
 
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 import requests
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.enums import ParseMode
+from aiogram import BaseMiddleware, Bot, Dispatcher, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
+from aiogram.types import Message, TelegramObject
 from dotenv import load_dotenv
+
+# OpenAI is optional (bot can run without it, but workout will require it)
+try:
+    from openai import OpenAI
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
+
 
 # -----------------------
 # ENV
 # -----------------------
-# If .env exists near bot.py -> load it. If not, still works with exported env vars.
 env_path = Path(__file__).resolve().parent / ".env"
 if env_path.exists():
     load_dotenv(env_path)
 else:
-    load_dotenv()  # harmless fallback
+    load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWM_API_KEY = os.getenv("OWM_API_KEY")  # OpenWeatherMap key (optional but recommended)
+OWM_API_KEY = os.getenv("OWM_API_KEY")  # OpenWeatherMap key (optional)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ChatGPT API key (recommended)
 
 if not BOT_TOKEN:
     raise RuntimeError("No BOT_TOKEN in environment. Put it in .env or export it before running.")
+
 
 # -----------------------
 # LOGGING
@@ -50,6 +72,7 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
 
 # -----------------------
 # DATA (in-memory)
@@ -70,18 +93,21 @@ class UserProfile:
     activity_min_per_day: int
     city: str
     calorie_goal: Optional[int] = None  # if user set manually
+
     # computed goals cached daily
     water_goal_ml: int = 0
     calorie_goal_final: int = 0
     last_goal_date: Optional[date] = None
+
     # per-day logs
     logs_by_date: Dict[date, DailyLog] = field(default_factory=dict)
 
 
 users: Dict[int, UserProfile] = {}
 
+
 # -----------------------
-# FSM: profile setup
+# FSM
 # -----------------------
 class ProfileFSM(StatesGroup):
     weight = State()
@@ -93,18 +119,75 @@ class ProfileFSM(StatesGroup):
     calorie_goal = State()
 
 
+class FoodFSM(StatesGroup):
+    waiting_grams = State()
+
+
 # -----------------------
-# Helpers: APIs
+# Middleware: log every user message (for deployment logs/screenshots)
+# -----------------------
+class CommandsLoggingMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict,
+    ) -> Any:
+        upd = data.get("event_update")
+        msg = getattr(upd, "message", None) if upd else None
+        if msg and getattr(msg, "text", None):
+            uid = msg.from_user.id if msg.from_user else "unknown"
+            logger.info(f"USER {uid}: {msg.text}")
+        return await handler(event, data)
+
+
+# -----------------------
+# Helpers: parsing
+# -----------------------
+def safe_float(s: str) -> Optional[float]:
+    try:
+        return float(s.replace(",", "."))
+    except Exception:
+        return None
+
+
+def safe_int(s: str) -> Optional[int]:
+    try:
+        return int(s.strip())
+    except Exception:
+        return None
+
+
+def fmt_int(n: float) -> str:
+    return str(int(round(n)))
+
+
+def extract_first_number(text: str) -> Optional[float]:
+    m = re.search(r"(\d+(?:[.,]\d+)?)", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "."))
+    except Exception:
+        return None
+
+
+# -----------------------
+# APIs: OpenWeather + OpenFoodFacts + OpenAI
 # -----------------------
 OFF_BASE = "https://world.openfoodfacts.org"
 OFF_HEADERS = {"User-Agent": "WaterFitBot/1.0 (student)"}
 
+openai_client = None
+if OpenAI is not None and OPENAI_API_KEY:
+    try:
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception:
+        openai_client = None
+
 
 def get_temperature_c(city: str) -> Optional[float]:
-    """
-    Returns temperature in Celsius from OpenWeatherMap current weather.
-    Requires OWM_API_KEY. If no key or error -> None.
-    """
+    """Returns temperature in Celsius from OpenWeatherMap current weather."""
     if not OWM_API_KEY:
         return None
     try:
@@ -123,10 +206,7 @@ def get_temperature_c(city: str) -> Optional[float]:
 
 
 def off_search_kcal_100g(query: str) -> Optional[Tuple[str, float]]:
-    """
-    Search product in OpenFoodFacts and return (product_name, kcal_per_100g).
-    Handles both kcal and kJ properly.
-    """
+    """Fallback: OpenFoodFacts search -> (product_name, kcal_per_100g)."""
     try:
         url = f"{OFF_BASE}/cgi/search.pl"
         r = requests.get(
@@ -152,20 +232,21 @@ def off_search_kcal_100g(query: str) -> Optional[Tuple[str, float]]:
             name = (p.get("product_name") or "").strip() or query
             nutr = p.get("nutriments", {}) or {}
 
-            # 1️⃣ Ищем kcal напрямую
             kcal = nutr.get("energy-kcal_100g")
             if kcal is not None:
                 try:
-                    return name, float(kcal)
+                    val = float(kcal)
+                    if 0 < val <= 1000:
+                        return name, round(val, 1)
                 except Exception:
                     pass
 
-            # 2️⃣ Иначе берём kJ и конвертируем
             kj = nutr.get("energy_100g")
             if kj is not None:
                 try:
                     kcal_from_kj = float(kj) / 4.184
-                    return name, round(kcal_from_kj, 1)
+                    if 0 < kcal_from_kj <= 1000:
+                        return name, round(kcal_from_kj, 1)
                 except Exception:
                     pass
 
@@ -173,37 +254,107 @@ def off_search_kcal_100g(query: str) -> Optional[Tuple[str, float]]:
     except Exception:
         return None
 
+
+def llm_kcal_100g(query: str) -> Optional[Tuple[str, float]]:
+    """ChatGPT: kcal per 100g. Must return only a number; we still extract safely."""
+    if not openai_client:
+        return None
+
+    try:
+        prompt = (
+            "Верни оценку калорийности продукта в ккал на 100 грамм.\n"
+            "Правила:\n"
+            "1) Верни ТОЛЬКО число (например: 89). Без текста и единиц.\n"
+            "2) Если это напиток, оцени на 100 грамм.\n"
+            "3) Если запрос неоднозначный, выбери самый типичный вариант.\n"
+            f"Продукт: {query}"
+        )
+
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        kcal = extract_first_number(text)
+
+        if kcal is None or kcal <= 0 or kcal > 1000:
+            return None
+
+        return query.strip(), round(float(kcal), 1)
+    except Exception as e:
+        logger.exception("LLM food kcal error: %s", e)
+        return None
+
+
+def get_kcal_100g(query: str) -> Optional[Tuple[str, float, str]]:
+    """Returns (name, kcal_100g, source) where source is 'openai' or 'off'."""
+    info = llm_kcal_100g(query)
+    if info:
+        name, kcal = info
+        return name, kcal, "openai"
+
+    info2 = off_search_kcal_100g(query)
+    if info2:
+        name, kcal = info2
+        return name, kcal, "off"
+
+    return None
+
+
+def llm_workout_kcal(workout_text: str, minutes: int, weight_kg: float) -> Optional[float]:
+    """
+    ChatGPT: burned kcal for free-form workout text + minutes + weight.
+    Returns kcal as number. We extract first number as safety.
+    """
+    if not openai_client:
+        return None
+
+    try:
+        prompt = (
+            "Оцени количество потраченных калорий (ккал) за тренировку.\n"
+            "Дай приблизительную оценку.\n"
+            "Правила:\n"
+            "1) Верни ТОЛЬКО число (например: 350). Без текста и единиц.\n"
+            "2) Учитывай вес человека, длительность и тип тренировки.\n"
+            "3) Если интенсивность не указана, считай средней.\n"
+            "4) Если запрос странный, всё равно верни реалистичное число.\n"
+            f"Вес: {weight_kg} кг\n"
+            f"Длительность: {minutes} минут\n"
+            f"Тренировка: {workout_text}"
+        )
+
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        kcal = extract_first_number(text)
+
+        if kcal is None or kcal <= 0 or kcal > 5000:
+            return None
+        return round(float(kcal), 1)
+    except Exception as e:
+        logger.exception("LLM workout kcal error: %s", e)
+        return None
+
+
 # -----------------------
 # Helpers: calculations
 # -----------------------
 def calculate_water_goal_ml(weight_kg: float, activity_min: int, temp_c: Optional[float]) -> int:
-    # base: 30 ml / kg
-    goal = int(weight_kg * 30)
-
-    # +500 ml per 30 min activity
-    goal += int((activity_min / 30) * 500)
-
-    # +500..1000 ml if hot
+    goal = int(weight_kg * 30)  # 30 ml / kg
+    goal += int((activity_min / 30) * 500)  # +500 ml per 30 min activity
     if temp_c is not None and temp_c > 25:
-        goal += 750  # middle value for simplicity
-
+        goal += 750
     return goal
 
 
 def calculate_calorie_goal(weight_kg: float, height_cm: float, age: int, sex: str, activity_min: int) -> int:
-    """
-    Simple Mifflin-St Jeor-like baseline without +5/-161 (we’ll keep close to your spec),
-    then add activity calories.
-    """
     base = 10 * weight_kg + 6.25 * height_cm - 5 * age
-    # sex adjustment (optional, but improves realism)
-    if sex == "m":
-        base += 5
-    else:
-        base -= 161
+    base += 5 if sex == "m" else -161
 
-    # activity add: 200..400 depending on minutes (simple linear clamp)
-    # 0 min => 0; 30 => 200; 60 => 400; >60 => 450
     if activity_min <= 0:
         add = 0
     elif activity_min <= 30:
@@ -232,38 +383,11 @@ def ensure_daily_goals(profile: UserProfile) -> None:
     profile.water_goal_ml = calculate_water_goal_ml(profile.weight_kg, profile.activity_min_per_day, temp)
 
     calc_kcal = calculate_calorie_goal(
-        profile.weight_kg,
-        profile.height_cm,
-        profile.age,
-        profile.sex,
-        profile.activity_min_per_day,
+        profile.weight_kg, profile.height_cm, profile.age, profile.sex, profile.activity_min_per_day
     )
     profile.calorie_goal_final = int(profile.calorie_goal if profile.calorie_goal is not None else calc_kcal)
     profile.last_goal_date = today
 
-
-# -----------------------
-# Workout calories (very simple MET-like table)
-# -----------------------
-WORKOUT_KCAL_PER_MIN = {
-    "бег": 10.0,
-    "run": 10.0,
-    "ходьба": 4.0,
-    "walk": 4.0,
-    "силовая": 6.0,
-    "gym": 6.0,
-    "велосипед": 8.0,
-    "bike": 8.0,
-    "плавание": 9.0,
-    "swim": 9.0,
-    "йога": 3.0,
-    "yoga": 3.0,
-}
-
-def estimate_workout_kcal(workout_type: str, minutes: int) -> float:
-    key = workout_type.strip().lower()
-    rate = WORKOUT_KCAL_PER_MIN.get(key, 6.0)  # default moderate
-    return round(rate * max(minutes, 0), 1)
 
 def extra_workout_water_ml(minutes: int) -> int:
     # +200 ml per 30 min workout
@@ -271,24 +395,9 @@ def extra_workout_water_ml(minutes: int) -> int:
 
 
 # -----------------------
-# Bot / Router
+# Router
 # -----------------------
 router = Router()
-
-def fmt_int(n: float) -> str:
-    return str(int(round(n)))
-
-def safe_float(s: str) -> Optional[float]:
-    try:
-        return float(s.replace(",", "."))
-    except Exception:
-        return None
-
-def safe_int(s: str) -> Optional[int]:
-    try:
-        return int(s.strip())
-    except Exception:
-        return None
 
 
 @router.message(CommandStart())
@@ -299,9 +408,9 @@ async def cmd_start(message: Message):
         "/set_profile — настроить профиль\n"
         "/log_water <мл> — записать воду\n"
         "/log_food <продукт> — записать еду\n"
-        "/log_workout <тип> <мин> — записать тренировку\n"
+        "/log_workout <описание> <мин> — записать тренировку (свободный ввод)\n"
         "/check_progress — прогресс за сегодня\n"
-        "/help — помощь",
+        "/help — помощь"
     )
 
 
@@ -311,10 +420,12 @@ async def cmd_help(message: Message):
         "🧭 Команды:\n"
         "• /set_profile\n"
         "• /log_water 300\n"
-        "• /log_food banana\n"
-        "• /log_workout бег 30\n"
+        "• /log_food банан\n"
+        "• /log_workout табата 25\n"
+        "• /log_workout футбол 60\n"
         "• /check_progress\n\n"
-        "Совет: OpenFoodFacts лучше ищет по-английски (banana, apple, bread).",
+        "Еда: ChatGPT API → fallback OpenFoodFacts.\n"
+        "Тренировки: ChatGPT API (свободный ввод)."
     )
 
 
@@ -426,15 +537,17 @@ async def profile_calorie_goal(message: Message, state: FSMContext):
     temp = get_temperature_c(profile.city)
     temp_txt = f"{temp:.1f}°C" if temp is not None else "не удалось получить (нет OWM_API_KEY или ошибка)"
 
+    gpt_status = "включён" if openai_client else "выключен (нет OPENAI_API_KEY)"
     await message.answer(
         "✅ Профиль сохранён!\n\n"
         f"Город: {profile.city} (температура: {temp_txt})\n"
         f"Норма воды: {profile.water_goal_ml} мл\n"
-        f"Цель калорий: {profile.calorie_goal_final} ккал\n\n"
+        f"Цель калорий: {profile.calorie_goal_final} ккал\n"
+        f"GPT: {gpt_status}\n\n"
         "Теперь можно логировать:\n"
         "/log_water 300\n"
-        "/log_food banana\n"
-        "/log_workout бег 30\n"
+        "/log_food банан\n"
+        "/log_workout табата 25\n"
         "/check_progress"
     )
 
@@ -474,12 +587,8 @@ async def log_water(message: Message):
 
 
 # -----------------------
-# Food logging (2-step): /log_food name -> ask grams -> calculate
+# Food logging (2-step)
 # -----------------------
-class FoodFSM(StatesGroup):
-    waiting_grams = State()
-
-
 @router.message(Command("log_food"))
 async def log_food(message: Message, state: FSMContext):
     user_id = message.from_user.id
@@ -489,26 +598,27 @@ async def log_food(message: Message, state: FSMContext):
 
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Формат: /log_food <продукт> (пример: /log_food banana)")
+        await message.answer("Формат: /log_food <продукт> (пример: /log_food банан)")
         return
 
     query = parts[1].strip()
-    info = off_search_kcal_100g(query)
-
-    # fallback: if Russian query often fails, try same as-is (we already did),
-    # but suggest using English if not found.
+    info = get_kcal_100g(query)
     if not info:
         await message.answer(
-            "❌ Не смог найти продукт в OpenFoodFacts.\n"
-            "Попробуйте на английском (например: banana, apple, bread)."
+            "❌ Не смог определить калорийность.\n"
+            "Попробуйте уточнить запрос (например: 'банан', 'гречка варёная', 'капучино без сахара')."
         )
         return
 
-    name, kcal_100g = info
+    name, kcal_100g, source = info
     await state.set_state(FoodFSM.waiting_grams)
-    await state.update_data(food_name=name, kcal_100g=kcal_100g)
+    await state.update_data(food_name=name, kcal_100g=kcal_100g, source=source)
 
-    await message.answer(f"🍽 {name} — {kcal_100g} ккал на 100 г.\nСколько грамм вы съели? (например: 150)")
+    src_txt = "ChatGPT" if source == "openai" else "OpenFoodFacts"
+    await message.answer(
+        f"🍽 {name} — {kcal_100g} ккал на 100 г. (источник: {src_txt})\n"
+        "Сколько грамм вы съели? (например: 150)"
+    )
 
 
 @router.message(FoodFSM.waiting_grams)
@@ -539,13 +649,13 @@ async def food_grams(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"✅ Записано: {name} — {kcal} ккал.\n"
-        f"Сегодня съедено: {round(log.food_kcal,1)} / {profile.calorie_goal_final} ккал.\n"
+        f"Сегодня съедено: {round(log.food_kcal, 1)} / {profile.calorie_goal_final} ккал.\n"
         f"Осталось до цели: {fmt_int(left)} ккал."
     )
 
 
 # -----------------------
-# Workout logging
+# Workout logging (FREE FORM + GPT)
 # -----------------------
 @router.message(Command("log_workout"))
 async def log_workout(message: Message):
@@ -554,28 +664,48 @@ async def log_workout(message: Message):
         await message.answer("Сначала настрой профиль: /set_profile")
         return
 
+    # We accept:
+    #   /log_workout табата 25
+    #   /log_workout футбол 60
+    # Parse: last token = minutes, the rest = free-form workout text
     parts = (message.text or "").split()
     if len(parts) < 3:
-        await message.answer("Формат: /log_workout <тип> <мин>\nПример: /log_workout бег 30")
+        await message.answer(
+            "Формат: /log_workout <описание> <мин>\n"
+            "Примеры:\n"
+            "/log_workout табата 25\n"
+            "/log_workout футбол 60"
+        )
         return
 
-    workout_type = parts[1]
-    minutes = safe_int(parts[2])
+    minutes = safe_int(parts[-1])
     if minutes is None or minutes <= 0 or minutes > 1000:
-        await message.answer("❌ Минуты должны быть числом. Пример: /log_workout бег 30")
+        await message.answer("❌ Последний аргумент должен быть минутами (число). Пример: /log_workout футбол 60")
+        return
+
+    workout_text = " ".join(parts[1:-1]).strip()
+    if not workout_text:
+        await message.answer("❌ Укажите описание тренировки. Пример: /log_workout силовая тренировка 45")
         return
 
     profile = users[user_id]
     ensure_daily_goals(profile)
     log = get_today_log(profile)
 
-    burned = estimate_workout_kcal(workout_type, minutes)
-    log.burned_kcal += burned
+    burned = llm_workout_kcal(workout_text, minutes, profile.weight_kg)
+    if burned is None:
+        await message.answer(
+            "❌ Не смог посчитать калории тренировки.\n"
+            "Проверь, что задан OPENAI_API_KEY (ChatGPT API) и интернет доступен."
+        )
+        return
 
+    log.burned_kcal += burned
     extra_water = extra_workout_water_ml(minutes)
-    # We do NOT auto-add water to drunk water. It's a recommendation.
+
     await message.answer(
-        f"🏋️ {workout_type} {minutes} мин — сожжено ~{burned} ккал.\n"
+        f"🏋️ Тренировка: {workout_text}\n"
+        f"⏱ {minutes} мин — сожжено ~{burned} ккал.\n"
         f"💧 Рекомендация: дополнительно выпейте {extra_water} мл воды."
     )
 
@@ -597,7 +727,7 @@ async def check_progress(message: Message):
     water_left = max(profile.water_goal_ml - log.water_ml, 0)
     eaten = round(log.food_kcal, 1)
     burned = round(log.burned_kcal, 1)
-    balance = round(eaten - burned, 1)  # net intake
+    balance = round(eaten - burned, 1)
 
     await message.answer(
         "📊 Прогресс за сегодня:\n\n"
@@ -612,31 +742,27 @@ async def check_progress(message: Message):
 
 
 # -----------------------
-# Optional: debug command
+# Optional: debug
 # -----------------------
 @router.message(Command("where_token"))
 async def where_token(message: Message):
-    # For local debug only. Doesn't print token. Shows if env var exists.
     exists = "YES" if os.getenv("BOT_TOKEN") else "NO"
-    await message.answer(f"BOT_TOKEN env present: {exists}")
+    gpt = "YES" if openai_client else "NO"
+    await message.answer(f"BOT_TOKEN env present: {exists}\nOPENAI enabled: {gpt}")
 
 
-# -----------------------
-# Middleware-like logging (simple)
-# -----------------------
 @router.message()
 async def log_all_messages(message: Message):
-    # This handler triggers only if no previous handler matched.
-    # Helpful to see that the bot receives messages even if command doesn't parse.
+    # if no handler matched
     logger.info(f"UNHANDLED USER {message.from_user.id}: {message.text!r}")
-    # Do not spam user; just hint once:
     if message.text and not message.text.startswith("/"):
         await message.answer("Я понимаю команды. Напишите /help")
 
 
 async def main():
-    bot = Bot(BOT_TOKEN)
+    bot = Bot(BOT_TOKEN)  # no parse_mode -> avoids HTML entity errors
     dp = Dispatcher(storage=MemoryStorage())
+    dp.update.middleware(CommandsLoggingMiddleware())  # log all updates
     dp.include_router(router)
 
     logger.info("Bot started.")
